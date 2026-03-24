@@ -1,0 +1,6 @@
+[submodule "vendor/torch2trt"]
+	path = vendor/torch2trt
+	url = https://github.com/NVIDIA-AI-IOT/torch2trt.git
+[submodule "vendor/whisper_trt"]
+	path = vendor/whisper_trt
+	url = https://github.com/NVIDIA-AI-IOT/whisper_trt.git
