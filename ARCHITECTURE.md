@@ -64,6 +64,7 @@
 │                                                     │
 │  English → Kokoro TTS (82M params)                  │
 │  Russian → Silero V5                                │
+│  Option → CosyVoice2-0.5B (voice cloning, ~3-4GB)  │
 └──────────────────────┬──────────────────────────────┘
                        │ audio
                        ▼
@@ -89,7 +90,7 @@ supervisord ────── process manager for all services
 OS + services          ~0.7 GB
 WhisperTRT small       ~1.0 GB
 LLM 3.8B Q4           ~2.5 GB
-Kokoro + Silero TTS    ~0.2 GB
+Kokoro + Silero TTS    ~0.2 GB  (or CosyVoice2-0.5B ~3-4 GB)
 openWakeWord + VAD     ~0.05 GB
 Redis + orchestrator   ~0.1 GB
 ─────────────────────────────

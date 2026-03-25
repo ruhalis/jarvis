@@ -44,4 +44,29 @@ cd vendor/whisper_trt && python setup.py install && cd ../..
 pip install -r requirements.txt
 ```
 
+### CosyVoice TTS (optional — voice cloning)
+
+```bash
+# Install CosyVoice dependencies (from vendored submodule)
+cd vendor/CosyVoice
+pip install -r requirements.txt
+cd ../..
+
+# System dependency
+sudo apt-get install sox libsox-dev
+
+# Download model (~2GB)
+python -c "
+from huggingface_hub import snapshot_download
+snapshot_download('FunAudioLLM/CosyVoice2-0.5B',
+                  local_dir='vendor/CosyVoice/pretrained_models/CosyVoice2-0.5B')
+"
+
+# NOTE: Do NOT install the ttsfrd .whl on Jetson — it's x86_64 only.
+# CosyVoice falls back to wetext automatically.
+
+# Test it
+python cosy_voice.py test
+```
+
 > **Note:** macOS is not supported — CUDA/TensorRT require an NVIDIA GPU.
