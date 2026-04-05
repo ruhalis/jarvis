@@ -1,0 +1,37 @@
+# Built-in routines. Fuzzy-matched by the router (rapidfuzz partial_ratio >= 80).
+# Matched routines execute their actions in order, no LLM round trip.
+#
+# Action types (Phase 2 subset):
+#   speak:         { text: "...", language: en|ru }
+#   ha_control:    { entity_id, service, attributes }   # stubbed, logs only
+#   system:        { command: stop_tts }
+#   defer_to_llm:  { prompt: "..." }                    # hand off to brain
+#
+# An `action` may be a mapping with exactly one of these keys.
+
+routines:
+  - name: good_morning
+    trigger: ["good morning", "let's get started", "wake up jarvis"]
+    actions:
+      - ha_control: { entity_id: light.living_room, service: turn_on, attributes: { brightness: 200 } }
+      - ha_control: { entity_id: light.kitchen, service: turn_on }
+      - speak: { text: "Good morning, sir. Lights are on.", language: en }
+      - defer_to_llm: { prompt: "Give a brief morning briefing: weather and the day ahead. One or two sentences." }
+
+  - name: good_night
+    trigger: ["good night", "goodnight", "go to sleep", "bedtime"]
+    actions:
+      - ha_control: { entity_id: light.living_room, service: turn_off }
+      - ha_control: { entity_id: light.bedroom, service: turn_off }
+      - ha_control: { entity_id: climate.main_thermostat, service: set_temperature, attributes: { temperature: 19 } }
+      - speak: { text: "Good night. Lights off, thermostat set to nineteen.", language: en }
+
+  - name: stop
+    trigger: ["stop", "shut up", "be quiet", "cancel", "стоп", "замолчи"]
+    actions:
+      - system: { command: stop_tts }
+
+  - name: thanks
+    trigger: ["thank you", "thanks jarvis", "спасибо"]
+    actions:
+      - speak: { text: "Always a pleasure.", language: en }

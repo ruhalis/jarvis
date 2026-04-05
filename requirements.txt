@@ -4,3 +4,6 @@ torch==2.8.0
 # tochvision==0.23.0
 torchaudio
 redis[hiredis]
+mcp
+rapidfuzz
+pyyaml

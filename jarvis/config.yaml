@@ -1,0 +1,26 @@
+# Jarvis runtime config. Loaded by router + brain.
+# Env vars override values here (REDIS_URL, HA_URL, HA_TOKEN, JARVIS_HOME).
+
+redis_url: redis://127.0.0.1:6379/0
+
+router:
+  # rapidfuzz partial_ratio threshold (0-100). Below this, forward to LLM.
+  fuzzy_threshold: 80
+  routines_paths:
+    - routines/default.yaml
+    - routines/custom.yaml
+
+brain:
+  # Lock Claude to only the speak tool for now. Phase 3 expands this.
+  allowed_tools:
+    - mcp__jarvis__speak
+  # How long to wait on a claude subprocess before giving up (seconds).
+  timeout_seconds: 30
+
+home_assistant:
+  url: http://192.168.1.x:8123
+  # token: pulled from HA_TOKEN env var
+
+tts:
+  # Default language when none specified.
+  default_language: en
