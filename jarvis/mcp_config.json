@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "jarvis": {
+      "command": "/Users/ruhalis/projects/jarvis/.venv/bin/python",
+      "args": ["/Users/ruhalis/projects/jarvis/jarvis/services/jarvis_mcp_server.py"]
+    }
+  }
+}
