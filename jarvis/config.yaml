@@ -21,6 +21,30 @@ home_assistant:
   url: http://192.168.1.x:8123
   # token: pulled from HA_TOKEN env var
 
+voice:
+  # Mode:
+  #   "auto"  — try mic pipeline (openWakeWord + Silero VAD + Parakeet); fall back to stdin if deps missing.
+  #   "mic"   — real mic pipeline (Jetson). Errors out if a component is missing.
+  #   "stdin" — read lines from stdin; each line publishes wake_detected + stt_result. Dev/test only.
+  #   "null"  — start, do nothing. For services that just need the process running.
+  mode: auto
+  # Wake word(s) for openWakeWord. The "jarvis" model ships with the package.
+  wake_models:
+    - jarvis
+  wake_threshold: 0.5
+  # Silero VAD endpoint detection.
+  vad_min_silence_ms: 500
+  vad_speech_pad_ms: 200
+  # STT
+  parakeet_model: nvidia/parakeet-tdt-0.6b-v3
+  # Audio capture
+  sample_rate: 16000
+  frame_ms: 20
+  # Mic device index (None = default input). Use `python -m sounddevice` to list.
+  input_device: null
+  # Pre-warm the brain on stable partials (B4). Off until brain wires the listener.
+  prewarm_partials: false
+
 tts:
   # Default language when none specified.
   default_language: en

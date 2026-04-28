@@ -16,6 +16,7 @@ import redis.asyncio as redis
 # Channel names — keep these in sync with any new services.
 CH_WAKE = "wake_detected"
 CH_STT = "stt_result"
+CH_STT_PARTIAL = "stt_partial"
 CH_LLM_REQUEST = "llm_request"
 CH_TTS_REQUEST = "tts_request"
 CH_TTS_DONE = "tts_done"
