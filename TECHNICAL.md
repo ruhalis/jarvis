@@ -1,9 +1,10 @@
 # Jarvis LLM Layer — Technical Specification
 
-**Version:** 1.1
+**Version:** 2.0
 **Date:** April 2026
 **Platform:** NVIDIA Jetson Orin Nano Super Developer Kit (8 GB RAM, ARM64, JetPack/CUDA)
 **Status:** Pre-implementation
+**Brain:** Dual-mode — Claude Agent SDK (cloud, default) + Gemma 4 E2B via claw-code (local fallback)
 
 ---
 
@@ -21,47 +22,56 @@ Build the "brain" layer of the Jarvis voice assistant — the component that tak
 
 ---
 
-## 2. Architecture Decision: Claude Code CLI
+## 2. Architecture Decision: Dual-Mode Brain
 
-**Chosen approach:** Use Claude Code CLI (`claude`) as the sole LLM backend, invoked as a subprocess from Python. Billed against the user's Claude Max subscription — no separate API billing.
+Jarvis runs in one of two modes, selected per-turn by a mode supervisor in `jarvis_brain.py`:
 
-**What Claude Code CLI provides for free:**
-- Agentic tool-calling loop (think → call tool → observe result → repeat)
-- MCP server support for custom tools
-- CLAUDE.md auto-loading into system prompt every turn (from `cwd`)
-- Session persistence across interactions via `--session-id`
-- Context window compaction when conversations get long
-- Streaming JSON output via `--output-format stream-json`
-- Built-in retry with backoff on failures
-- Hooks system (settings.json) for safety and routing
-- Built-in `Read` and `Write` file tools for self-updating memory
+| | Mode A — Cloud (default) | Mode B — Local fallback |
+|---|---|---|
+| Harness | **Claude Agent SDK** (Python) | **claw-code** Rust binary |
+| Model | Claude Haiku 4.5 (escalate to Sonnet 4.6 on hard queries) | **Gemma 4 E2B (5B, VLA)** Q4_K_M via llama.cpp `llama-server` |
+| Auth | `ANTHROPIC_API_KEY` | none (local) |
+| Cost | ~$5–15/month (with prompt caching) | $0 |
+| Latency | ~300–600 ms TTFT | ~1–3 s TTFT on Orin Nano |
+| Quality | strong tool-use, reliable | weaker — more clarification, occasional dropped tool calls |
+| Internet | required | not required |
 
-**What it does NOT provide (we build these):**
-- Voice pipeline (STT → router → TTS)
-- Custom MCP tool servers (Home Assistant, TTS, weather, timers)
-- CLAUDE.md content (personality, memory, entity list, behavioral rules)
-- Stream filtering (route `speak` tool calls to TTS, suppress internal reasoning from voice)
-- Redis pub/sub bridge to the rest of the pipeline
-- Offline fallback (YAML routines only, no LLM)
+**Mode selection logic** (each turn, before dispatch):
+- If `ANTHROPIC_API_KEY` present AND network reachable AND last N requests didn't 5xx/429 → **Mode A**
+- Otherwise → **Mode B** (announce "running offline, sir" once per outage transition)
+
+Both modes connect to the same `jarvis_mcp_server.py` over MCP, share the same `~/.jarvis/CLAUDE.md`, and emit the same `speak` tool calls to Redis. The voice pipeline is mode-agnostic.
+
+**Why Claude Agent SDK over Claude Code CLI for cloud:**
+- First-class prompt caching (90% discount on cached input — CLAUDE.md + tool defs cached per session)
+- Python-native — no subprocess JSON streaming, no `--session-id`/`--resume` UUID juggling
+- Cleaner MCP wiring directly in process
+- **No Max-subscription ToS ambiguity** around programmatic/automated use of a developer tool
+- Estimated $5–15/month on Haiku 4.5 with caching for typical personal use, vs $100–200/month flat for Max
+
+**Why claw-code for the local fallback (vs raw Ollama API):**
+- claw-code is an OSS Rust port of the Claude Code agent loop — same think → tool → observe pattern
+- Speaks MCP natively → reuses `jarvis_mcp_server.py` unchanged
+- Routes to OpenAI-compatible endpoints via `.claw.json` config → points at Ollama's `/v1` server
+- Avoids hand-rolling a tool-calling loop on top of `ollama.chat()`
+- Already vendored at `claw-code/` in this repo (Rust workspace, build with `cargo build --workspace`)
+
+> **Verify before Phase 4:** confirm claw-code's current OpenAI-compatible base-URL config (custom `base_url` + `api_key` in `.claw.json`) actually round-trips MCP tool calls against `llama-server --jinja`. If not, we either patch claw-code or fall back to a thin custom harness around `llama-server`'s `/v1/chat/completions` with tool support.
+
+**Why Gemma 4 E2B for local:**
+- 5B-parameter Vision-Language model; ~3.0 GB resident at Q4_K_M — fits alongside Parakeet (0.7 GB) + Kokoro (0.15 GB) + system on the 8 GB Jetson (NVIDIA validates the Q4_K_M build on Jetson Orin Nano Super 8 GB; recommends 8 GB swap as a load-time safety net)
+- Native tool-calling enabled via `llama-server --jinja` (Gemma 4's chat template advertises tools to the model) — stronger than Gemma 3 4B at deciding when to call vs. answer
+- **Optional vision** via the `mmproj-gemma4-e2b-f16.gguf` projector (~0.5 GB extra). Lets a single `look_and_answer` MCP tool grab a webcam frame so Jarvis can answer "what am I holding?" without a separate VLM service. Skip the mmproj load if vision isn't wanted — the model runs text-only.
+- English-strong (matches the English-only TTS scope decision in §3.1.2)
+- GGUF weights on Hugging Face (`ggml-org/gemma-4-E2B-it-GGUF`, `unsloth/gemma-4-E2B-it-GGUF`); served by llama.cpp's `llama-server`, which exposes an OpenAI-compatible `/v1` endpoint that claw-code can hit directly
+- Fits with CV3 unloaded; CV3 + Gemma cannot both be hot — TTS service swaps Kokoro↔CV3 and brain swaps cloud↔local independently
 
 **Accepted tradeoffs:**
-- Requires Node.js 22+ on the Jetson (Claude Code CLI is Node-based)
-- ~500ms–1s subprocess startup on first query per session
-- Cloud-only for LLM — no local fallback via Ollama (YAML routines cover offline)
-- Single provider (Anthropic) — no model switching
-- Tools run as MCP servers (separate processes) rather than in-process
-
-**Why Claude Code CLI over alternatives:**
-- vs. Claude Agent SDK: Agent SDK requires separate API billing (API key only, no subscription auth). Claude Code CLI bills against Max subscription — no extra cost.
-- vs. raw Claude API: saves building the entire tool-calling loop, session management, and context compaction from scratch. Also requires separate API billing.
-- vs. OpenClaw: no separate Node.js gateway, simpler deployment, built-in session management
-- vs. local LLM (Ollama): Claude is far more capable for tool use and reasoning. YAML routines cover offline.
-
-**Billing:**
-- Claude Code CLI authenticates via OAuth (`claude login`) on the Jetson
-- All usage bills against the Claude Max subscription ($100–200/month flat)
-- No API key or per-token charges needed
-- Cost is predictable and bundled with the subscription
+- **Two code paths to maintain.** The brain service has a Mode A path (Agent SDK) and a Mode B path (claw-code subprocess). Mitigated by sharing MCP server, CLAUDE.md, and Redis schema.
+- **Local mode quality drop.** Gemma 4 E2B will occasionally fail to emit a `speak` call, mis-route to the wrong tool, or hallucinate entity IDs. The safety-gate hook (§3.5) is the backstop.
+- **Local mode latency.** First inference after load is ~1 minute on Orin Nano Super (model warmup); steady-state TTFT is ~1–3 s. Keep `llama-server` resident (`supervisord`) so the warmup is paid once at boot, not per turn.
+- Need llama.cpp built from source on the Jetson with CUDA (`-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=87`) plus ~3 GB of GGUF weights (and ~0.5 GB more if mmproj/vision is enabled). NVIDIA also publishes a prebuilt Jetson container (`ghcr.io/nvidia-ai-iot/llama_cpp:latest-jetson-orin`) for text-only deployments.
+- claw-code's OpenAI-compat routing against `llama-server` is the integration risk — verify early.
 
 ---
 
@@ -70,9 +80,9 @@ Build the "brain" layer of the Jarvis voice assistant — the component that tak
 ### 3.1 Voice Pipeline (Context — already designed)
 
 ```
-Mic → openWakeWord → Silero VAD → WhisperTRT (STT)
+Mic → openWakeWord → Silero VAD → Parakeet-TDT-0.6b-v3 (streaming STT)
                                         │
-                                   transcribed text
+                                   transcribed text (incremental partials + final)
                                         │
                                         ▼
                                ┌─ Command Router ─┐
@@ -92,39 +102,198 @@ Mic → openWakeWord → Silero VAD → WhisperTRT (STT)
 
 The LLM layer sits at the "Claude Code CLI" box. Everything else is handled by other services communicating via Redis pub/sub.
 
-### 3.2 Claude Code CLI Integration
+### 3.1.1 STT: Parakeet-TDT-0.6b-v3 (streaming)
+
+**Chosen model:** NVIDIA `nvidia/parakeet-tdt-0.6b-v3` running in cache-aware streaming mode via NeMo (TensorRT export where supported).
+
+**Why Parakeet over WhisperTRT:**
+- **Streaming-native** Token-and-Duration Transducer — emits committed tokens incrementally as audio arrives, rather than re-decoding a sliding window like Whisper. First partial token typically lands in 200–400 ms vs 800–1500 ms for streamed Whisper on Jetson.
+- **Multilingual v3** covers 25 European languages including **Russian** — meets the bilingual requirement (v1/v2 were English-only, do not use them).
+- **SOTA WER** on multilingual benchmarks at 0.6B params (smaller than whisper-large-v3, more accurate on most European languages).
+- **Built-in punctuation, capitalization, and word timestamps** — cleaner input to the LLM, no second pass.
+- NVIDIA-native (NeMo) → first-class Jetson + TensorRT path.
+
+**Accepted tradeoffs:**
+- ~0.7 GB INT8 / ~1.2 GB FP16 resident with streaming cache — heavier than whisper-base, fits the 8 GB budget.
+- Streaming cache-aware TensorRT export from NeMo is less paved than WhisperTRT's prebuilt path; expect up-front deployment work.
+- Russian quality is strong on benchmarks but less battle-tested in the wild than Whisper's Russian — validate with real mic audio before committing past Phase 2.
+
+**Latency unlock — partial-transcript pre-warm:**
+Because partials are *committed* (don't rewrite), the brain service can act on stable partials before VAD endpoints the utterance:
+1. Run the command router's fuzzy match on growing partials — pre-resolve routine matches.
+2. **Pre-spawn `claude -p`** as soon as a stable partial arrives, so Node.js / Claude Code CLI cold-start (~500 ms–1 s) overlaps with the user finishing their sentence.
+3. Use STT confidence + VAD silence jointly to endpoint earlier.
+
+This is expected to shave 500–1000 ms off perceived wake-to-speak latency on top of the raw STT speedup.
+
+### 3.1.2 TTS: Kokoro (default) + Fun-CosyVoice3-0.5B (cloned voice)
+
+**Scope decision:** Jarvis is **English-only**. Russian support is dropped. This unlocks the smaller/faster variant of every component and makes a local LLM tier feasible.
+
+**Default TTS — Kokoro:**
+- 82M params, ~150 MB GPU resident, Apache 2.0
+- High MOS for its size, ~50 prebuilt voices — pick one as the canonical Jarvis voice
+- ~100–200 ms first-audio on Jetson; effectively free latency-wise
+- **Always hot.** Handles all routine responses.
+
+**Premium TTS — Fun-CosyVoice3-0.5B-2512 (Phase 5):**
+- Hugging Face: `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` (paper: arXiv 2505.17589)
+- 0.5B params, ~3.5 GB GPU resident
+- **Bi-streaming** (text-in + audio-out streaming) → 150 ms first-audio
+- **Zero-shot voice cloning** from a 6–10 s reference clip; 0.81 % CER, 77.4 % speaker similarity — best-in-class at this size
+- 9 languages incl. English (Russian not supported, irrelevant here) + 18 dialects, cross-lingual cloning
+- Optimized path is **Triton + TensorRT-LLM** (RTF 0.04–0.10, ~4× speedup over plain PyTorch). Without TRT-LLM, falls back to roughly CosyVoice2 speed.
+
+**Why CV3 over CosyVoice2:** same param count, better metrics across the board (CER, speaker similarity, latency), bi-streaming built in, more recent (Dec 2025).
+
+**Why CV3 in addition to Kokoro instead of replacing it:** CV3 is ~23× larger and only earns its keep when you actually want a *cloned* voice. For "turn on the lights — done, sir" you don't need 3.5 GB of model. Kokoro is the daily driver; CV3 is the special-occasion engine.
+
+**Swap pattern (TTS service, `jarvis_tts.py`):**
+- Subscribe to `tts_request` Redis channel; payload includes `voice` field
+- `voice = "kokoro:<voice_id>"` → render with Kokoro (always hot)
+- `voice = "cv3:<speaker_ref>"` → if CV3 not loaded, swap it in (~1–2 s); render; keep loaded for ~60 s of inactivity then unload
+- Pre-cache common phrases as WAV under `~/.jarvis/cache/tts/` — bypasses both engines for instant playback
+
+**Accepted tradeoffs:**
+- CV3 first use after idle pays a 1–2 s warmup. Mitigation: pre-warm on `wake_detected` if last response used CV3.
+- CV3 + a future local LLM (Gemma 4 E2B, ~3.5 GB) cannot both be hot — they must serialize against each other on the 8 GB board.
+- Triton + TensorRT-LLM on Jetson Orin Nano ARM64 is non-trivial to deploy; budget real time for it in Phase 5.
+- December 2025 model — less battle-tested than CosyVoice2; validate audio quality with real reference clips before committing.
+
+### 3.2 Brain Service — Dual-Mode Dispatcher
 
 **Entry point:** A Python service (`jarvis_brain.py`) that:
 1. Subscribes to Redis channel `stt_result`
-2. Receives transcribed text
-3. Calls `claude` CLI as a subprocess with `--session-id` and `--output-format stream-json`
-4. Parses streaming JSON, routing `speak` tool calls to Redis channel `tts_request`
+2. Picks the mode for this turn (cloud vs local)
+3. Dispatches to the appropriate adapter
+4. Routes `speak` tool calls to Redis channel `tts_request` (same downstream for both modes)
 5. Logs all events to JSONL transcript
 
 ```python
-# Simplified flow (not production code)
-import subprocess
-import json
+# jarvis_brain.py — simplified dispatcher
+class Brain:
+    def __init__(self):
+        self.cloud = CloudAdapter()   # Claude Agent SDK
+        self.local = LocalAdapter()   # claw-code → Ollama → Gemma
+        self.health = ModeSupervisor()
 
-async def query_claude(user_text: str, session_id: str) -> None:
-    proc = await asyncio.create_subprocess_exec(
-        "claude", "-p", user_text,
-        "--session-id", session_id,  # must be a UUID
-        "--output-format", "stream-json",
-        "--verbose",                 # required with stream-json in -p mode
-        "--mcp-config", str(MCP_CONFIG_PATH),
-        "--allowedTools", "mcp__jarvis__speak",  # Phase 1: lock to speak only
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=str(JARVIS_HOME),  # so Claude Code reads ~/.jarvis/CLAUDE.md
-    )
-
-    async for line in proc.stdout:
-        event = json.loads(line)
-        if is_speak_tool_call(event):
-            await redis.publish("tts_request", extract_speech(event))
-        log_to_jsonl(event)
+    async def handle(self, user_text: str, session_id: str):
+        mode = self.health.pick_mode()
+        adapter = self.cloud if mode == "cloud" else self.local
+        try:
+            async for event in adapter.stream(user_text, session_id):
+                if is_speak_tool_call(event):
+                    await redis.publish("tts_request", extract_speech(event))
+                log_to_jsonl(event, mode=mode)
+        except (NetworkError, RateLimitError, ProviderError) as e:
+            self.health.record_failure(mode, e)
+            if mode == "cloud":
+                # immediate failover for this turn
+                await self.local.stream(user_text, session_id)
 ```
+
+#### 3.2.1 Mode A — CloudAdapter (Claude Agent SDK)
+
+```python
+from anthropic import AsyncAnthropic
+from anthropic.lib.tools import MCPClient
+
+client = AsyncAnthropic()  # reads ANTHROPIC_API_KEY
+
+async def stream(user_text: str, session_id: str):
+    system = load_claude_md()  # ~/.jarvis/CLAUDE.md
+    async with client.messages.stream(
+        model="claude-haiku-4-5",     # default; escalate to claude-sonnet-4-6 on demand
+        system=[{
+            "type": "text",
+            "text": system,
+            "cache_control": {"type": "ephemeral"},  # 90% discount on reuse
+        }],
+        messages=load_session(session_id) + [{"role": "user", "content": user_text}],
+        mcp_servers=[{"type": "stdio", "command": MCP_SERVER_CMD}],
+        max_tokens=512,
+    ) as stream:
+        async for event in stream:
+            yield event
+```
+
+Key points:
+- **Prompt caching is mandatory** — without `cache_control` on CLAUDE.md + tool defs, monthly cost rises 3–5×.
+- **MCP server is the same** `jarvis_mcp_server.py` used by Mode B.
+- **Session storage** lives in `~/.jarvis/sessions/<date>.json` (a list of message dicts), not in Anthropic's session feature.
+- **Model escalation:** if Haiku returns a low-confidence response (e.g., the model asks "did you mean…" or fails to emit a tool call), retry once on Sonnet 4.6. Cap escalations per day to avoid bill spikes.
+
+#### 3.2.2 Mode B — LocalAdapter (claw-code → llama.cpp `llama-server` → Gemma 4 E2B)
+
+```python
+async def stream(user_text: str, session_id: str):
+    proc = await asyncio.create_subprocess_exec(
+        CLAW_BIN,                    # /opt/jarvis/claw-code/rust/target/release/claw
+        "prompt", user_text,
+        "--config", str(CLAW_CONFIG),  # ~/.jarvis/claw.json
+        "--mcp-config", str(MCP_CONFIG_PATH),
+        "--session", session_id,
+        "--stream", "json",
+        stdout=asyncio.subprocess.PIPE,
+        cwd=str(JARVIS_HOME),
+        env={**os.environ, "OPENAI_API_KEY": "sk-local"},  # llama-server ignores key, claw-code requires non-empty
+    )
+    async for line in proc.stdout:
+        yield json.loads(line)
+```
+
+`~/.jarvis/claw.json` (Mode B harness config):
+
+```json
+{
+  "provider": "openai",
+  "base_url": "http://127.0.0.1:8080/v1",
+  "model": "gemma-4-E2B-it",
+  "system_prompt_path": "~/.jarvis/CLAUDE.md",
+  "tool_choice": "auto",
+  "max_tokens": 384
+}
+```
+
+`llama-server` is started by supervisord at boot and stays resident, so Gemma's ~1-minute warmup is paid once. Recommended launch flags (from NVIDIA's Jetson Orin Nano guide):
+
+```bash
+~/llama.cpp/build/bin/llama-server \
+  -m ~/models/gemma-4-E2B-it-Q4_K_M.gguf \
+  --mmproj ~/models/mmproj-gemma4-e2b-f16.gguf \   # omit for text-only (saves ~0.5 GB)
+  -c 2048 \
+  --image-min-tokens 70 --image-max-tokens 70 \
+  --ubatch-size 512 --batch-size 512 \
+  --host 127.0.0.1 --port 8080 \
+  -ngl 99 --flash-attn on \
+  --no-mmproj-offload --jinja -np 1
+```
+
+`--jinja` is mandatory — it activates Gemma 4's native tool-calling chat template, without which claw-code will get plain text back instead of structured tool calls.
+
+#### 3.2.3 Mode supervisor
+
+```python
+class ModeSupervisor:
+    def __init__(self):
+        self.recent_failures = deque(maxlen=5)
+        self.last_announced_mode = None
+
+    def pick_mode(self) -> str:
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            return "local"
+        if not self._network_up():
+            return "local"
+        if sum(self.recent_failures) >= 3:
+            return "local"   # cooldown
+        return "cloud"
+
+    def _network_up(self) -> bool:
+        # cheap TCP check to api.anthropic.com:443, 500ms timeout
+        ...
+```
+
+When the supervisor flips modes, it emits a `state_change` Redis event so the dashboard reflects "ONLINE" vs "OFFLINE" and the brain can prepend "running offline, sir — " to the next response (once, not on every turn).
 
 ### 3.3 CLAUDE.md — The Single Source of Truth
 
@@ -333,19 +502,11 @@ else:
 
 ### 3.6 Session and Memory Management
 
-**Session persistence:** Claude Code CLI requires `--session-id` to be a **UUID** (not an arbitrary string). Use `--session-id <uuid>` to *create* a new session, and `--resume <uuid>` to *continue* an existing one — reusing `--session-id` on an existing UUID errors with "Session ID already in use".
+**Session storage:** the brain owns session state directly — neither adapter relies on a hosted session feature. Each turn's messages are appended to `~/.jarvis/sessions/YYYY-MM-DD.json` (a list of `{role, content}` dicts). Both adapters load this list and prepend it to the request, which keeps mode switches transparent — Gemma sees the same conversation Claude did.
 
-Strategy: derive one UUID per calendar day (e.g. `uuid.uuid5(NS, date.isoformat())`), try `--resume` first, fall back to `--session-id` on the first call of the day.
+**Daily rotation:** at midnight, a maintenance task runs one final Mode A turn (preferred) asking Claude to summarize the day's important facts and write them via the `memory_write` MCP tool into CLAUDE.md's Memory section. Then it starts a fresh empty session file for the next day.
 
-```python
-import uuid, datetime as dt
-JARVIS_NS = uuid.UUID("6f3c1b1e-7a2a-4e0f-9e7b-4a8b5c2d1e00")
-session_uuid = str(uuid.uuid5(JARVIS_NS, dt.date.today().isoformat()))
-# Day 1: claude -p ... --session-id <uuid>
-# Day 1, turn 2+: claude -p ... --resume <uuid>
-```
-
-**Daily session rotation:** A new UUID is derived at midnight automatically. Before rotating, the brain service sends a final prompt asking Claude to summarize key facts and update CLAUDE.md's Memory section using the built-in Write tool.
+**Why not hosted sessions:** Anthropic's session API and claw-code's session feature both exist, but using either ties us to one mode. Local JSON keeps mode switching cheap and debuggable.
 
 **JSONL transcript:** Every message (user input, assistant response, tool calls, tool results) is appended to `~/.jarvis/logs/YYYY-MM-DD.jsonl`. One JSON object per line. Human-readable, greppable.
 
@@ -358,7 +519,7 @@ session_uuid = str(uuid.uuid5(JARVIS_NS, dt.date.today().isoformat()))
 
 ### 3.7 Stream Filtering
 
-Claude Code CLI with `--output-format stream-json` emits one JSON object per line. Our stream filter parses these:
+Both adapters yield events in a normalized shape (`{type, ...}`) so the filter is mode-agnostic:
 
 | Event type | Action |
 |---|---|
@@ -368,7 +529,9 @@ Claude Code CLI with `--output-format stream-json` emits one JSON object per lin
 | Tool result | Log to JSONL |
 | Message end | Update state machine to IDLE or SPEAKING |
 
-Key insight: because `speak` is a tool, there is a clean separation. All spoken output goes through the tool. All other text is internal reasoning that gets logged but never vocalized.
+Mode A (Agent SDK) emits these events natively. Mode B normalizes claw-code's stream-json into the same shape inside `LocalAdapter.stream()`.
+
+Key insight: because `speak` is a tool, there is a clean separation. All spoken output goes through the tool. All other text is internal reasoning that gets logged but never vocalized — this matters more in Mode B, where Gemma is more prone to "thinking out loud."
 
 ---
 
@@ -443,8 +606,12 @@ routines:
 
 | Package | Purpose | Install |
 |---|---|---|
-| Claude Code CLI | LLM brain (subprocess) | `npm install -g @anthropic-ai/claude-code` |
-| Node.js 22+ | Claude Code runtime | `apt install nodejs` or nvm |
+| `anthropic` (Python SDK) | Mode A — Claude Agent SDK | `pip install anthropic` |
+| Rust toolchain | Build claw-code (Mode B harness) | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
+| claw-code | Mode B agent harness (vendored at `claw-code/`) | `cd claw-code/rust && cargo build --release --workspace` |
+| llama.cpp (CUDA) | Local model server (Mode B) | Build from source with `-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=87`, or pull `ghcr.io/nvidia-ai-iot/llama_cpp:latest-jetson-orin` |
+| Gemma 4 E2B (Q4_K_M GGUF) | Local model weights, ~3 GB | `huggingface-cli download ggml-org/gemma-4-E2B-it-GGUF gemma-4-E2B-it-Q4_K_M.gguf` |
+| `mmproj-gemma4-e2b-f16.gguf` | Vision projector (optional, for `look_and_answer` tool), ~0.5 GB | `huggingface-cli download ggml-org/gemma-4-E2B-it-GGUF mmproj-gemma4-e2b-f16.gguf` |
 | Python 3.10+ | All services | Pre-installed on JetPack |
 | Redis | Event bus | `apt install redis-server` |
 | `mcp` | MCP server framework | `pip install mcp` |
@@ -455,18 +622,21 @@ routines:
 ### Authentication
 
 ```bash
-# One-time setup: authenticate Claude Code with Max subscription
-claude login
-# This opens a browser OAuth flow — no API key needed
+# Mode A — Anthropic API key (per-token billing, no Max subscription)
+export ANTHROPIC_API_KEY="sk-ant-..."
+
+# Mode B — no auth required (local llama-server on 127.0.0.1:8080)
 ```
 
 ### Environment Variables
 
 ```bash
-# No ANTHROPIC_API_KEY needed — Claude Code uses OAuth subscription auth
+export ANTHROPIC_API_KEY="sk-ant-..."     # Mode A; absence forces Mode B
 export HA_URL="http://192.168.1.x:8123"
 export HA_TOKEN="eyJ..."
 export JARVIS_HOME="$HOME/.jarvis"
+export LLAMA_SERVER_URL="http://127.0.0.1:8080/v1"  # Mode B endpoint (llama.cpp llama-server)
+export JARVIS_BRAIN_FORCE_MODE=""         # "cloud" | "local" | "" (auto)
 ```
 
 ---
@@ -474,53 +644,64 @@ export JARVIS_HOME="$HOME/.jarvis"
 ## 7. Memory Budget (Updated)
 
 ```
-OS + system services       ~0.7 GB
-WhisperTRT small           ~1.0 GB
-Kokoro + Silero TTS        ~0.2 GB  (or CosyVoice2-0.5B ~3–4 GB)
-openWakeWord + Silero VAD  ~0.05 GB
-Redis + orchestrator       ~0.1 GB
-Node.js (Claude Code CLI)  ~0.1 GB
-MCP server (Python)        ~0.05 GB
-Python services            ~0.1 GB
-───────────────────────────────────
-Total                      ~2.3 GB  (with Kokoro/Silero)
-                           ~5.2 GB  (with CosyVoice2)
-Available                  8.0 GB
-Headroom                   ~2.8–5.7 GB
+OS + system services        ~0.7 GB
+Parakeet-TDT-0.6b-v3 (INT8) ~0.7 GB   (streaming, cache-aware)
+Kokoro TTS (English)        ~0.15 GB  (default, always hot)
+Fun-CosyVoice3-0.5B         ~3.5 GB   (Phase 5, on-demand swap-in for cloned voice)
+Gemma 4 E2B Q4_K_M (llama.cpp) ~3.0 GB (Mode B local brain, hot when no internet)
+mmproj-gemma4-e2b-f16        ~0.5 GB   (optional, only if vision/`look_and_answer` enabled)
+openWakeWord + Silero VAD   ~0.05 GB
+Redis + orchestrator        ~0.1 GB
+claw-code (Rust binary)     ~0.05 GB  (only resident when Mode B active)
+MCP server (Python)         ~0.05 GB
+Python services             ~0.15 GB
+───────────────────────────────────────
+Mode A, Kokoro hot                   ~1.95 GB    headroom ~6.0 GB
+Mode A, CV3 swapped in               ~5.30 GB    headroom ~2.7 GB
+Mode B text-only (Gemma + Kokoro)    ~4.95 GB    headroom ~3.0 GB
+Mode B with vision (+ mmproj)        ~5.45 GB    headroom ~2.5 GB
+Mode B (Gemma + CV3 hot)             ~8.30 GB    headroom <0 GB  ← over budget, forbidden
+Available                            8.0 GB
 ```
 
-Note: LLM runs in the cloud (Claude Max subscription), so no local LLM memory needed. GPU is free for WhisperTRT during STT, then idle during LLM processing, then available for CosyVoice TTS if using GPU mode.
+**Coexistence rules:**
+- **Cloud mode (A)** uses no local LLM memory — full headroom for STT + TTS.
+- **Local mode (B)** keeps Gemma resident; coexists fine with Kokoro.
+- **Gemma 4 E2B + CV3 simultaneously exceeds 8 GB.** If Mode B is active, the TTS service must refuse CV3 swap-in — fall back to Kokoro for the cloned-voice path until cloud comes back, or unload `llama-server` briefly. NVIDIA recommends 8 GB of swap configured on the Jetson as a safety net during model loads.
+- The mode supervisor and TTS service publish their resident-model state to Redis (`brain_state`, `tts_state`) so each can see what the other is holding.
 
 ---
 
 ## 8. Build Phases
 
-### Phase 1 — Minimal voice loop (Week 1–2)
-**Goal:** Speak to Jarvis, get a spoken response.
+### Phase 1 — Minimal voice loop, Mode A only (Week 1–2)
+**Goal:** Speak to Jarvis, get a spoken response. Cloud only — local fallback is Phase 4.
 
-- [ ] Install Claude Code CLI + Node.js on Jetson *(dev machine done, Jetson pending)*
-- [x] Run `claude login` to authenticate with Max subscription
+- [ ] Install Python `anthropic` SDK on Jetson; set `ANTHROPIC_API_KEY`
 - [x] Write `CLAUDE.md` with basic personality and voice rules
 - [x] Implement MCP server with `speak` tool
 - [x] Write `mcp_config.json` pointing to the MCP server
-- [x] Wire: hardcoded text input → `claude -p` subprocess → `speak` tool → stdout *(TTS deferred to Phase 2)*
+- [ ] Implement `CloudAdapter` in `jarvis_brain.py` using Agent SDK
+- [ ] Wire prompt caching on CLAUDE.md + tool defs (verify cache_read tokens > 0 in usage)
+- [x] Wire: hardcoded text input → adapter → `speak` tool → stdout *(TTS deferred to Phase 2)*
 - [x] Verify the LLM only speaks via the `speak` tool, never outputs bare text
-- [x] Add basic JSONL logging
+- [x] Add basic JSONL logging including per-turn `mode`, input/output tokens, cache hit ratio
 
-**Phase 1 gotchas (learned in build):**
-- `--session-id` must be a UUID. Use `--resume` for subsequent turns.
-- `--output-format stream-json` requires `--verbose` in `-p` mode, otherwise claude exits silently.
+**Phase 1 gotchas (carried over from CLI prototype):**
 - MCP server `command` must be an absolute path to the venv's `python`, not `python3`.
-- Scope tools with `--allowedTools mcp__jarvis__speak` so Claude can't fall back to built-in tools.
-- MCP tools are namespaced as `mcp__<server>__<tool>` in stream-json events — match by suffix.
+- MCP tools are namespaced as `mcp__<server>__<tool>` — match by suffix.
+- Scope `allowed_tools` so the model can't try built-ins it doesn't have.
 
-**Milestone:** Type a sentence, hear Jarvis respond in the Jarvis voice.
+**Milestone:** Type a sentence, hear Jarvis respond. Cache hit ratio > 80% after the first turn.
 
 ### Phase 2 — Voice pipeline integration (Week 3–4)
 **Goal:** Full wake-to-speak loop.
 
-- [ ] Connect openWakeWord → Silero VAD → WhisperTRT (already designed)
+- [ ] Connect openWakeWord → Silero VAD → Parakeet-TDT-0.6b-v3 (streaming, cache-aware)
+- [ ] Export Parakeet from NeMo to TensorRT INT8 for Jetson Orin Nano; benchmark first-partial latency
+- [ ] Publish both partial and final transcripts to Redis (`stt_partial`, `stt_result`)
 - [ ] Implement Redis pub/sub bridge: `stt_result` → brain → `tts_request`
+- [ ] Pre-warm `claude -p` on stable partial transcripts to overlap Node cold-start with end of utterance
 - [ ] Implement command router with `rapidfuzz` and default YAML routines
 - [ ] Implement state machine: IDLE → LISTENING → PROCESSING → SPEAKING → IDLE
 - [ ] Add `defer_to_llm` support in routines
@@ -540,22 +721,35 @@ Note: LLM runs in the cloud (Claude Max subscription), so no local LLM memory ne
 
 **Milestone:** "Hey Jarvis, turn on the living room lights" → lights turn on, Jarvis confirms.
 
-### Phase 4 — Memory and personality (Week 7–8)
-**Goal:** Jarvis remembers and learns.
+### Phase 4 — Memory, personality, and **local fallback (Mode B)** (Week 7–9)
+**Goal:** Jarvis remembers, learns, and survives offline.
 
-- [ ] Enable self-updating CLAUDE.md (Claude Code writes to Memory section via built-in Write tool)
-- [ ] Implement daily session rotation with `--session-id jarvis-YYYY-MM-DD`
+Memory & personality:
+- [ ] Enable self-updating CLAUDE.md (a `memory_write` MCP tool that appends to the Memory section, gated by safety hook)
+- [ ] Implement daily session rotation (rotate JSONL transcript + summary write at midnight)
 - [ ] Add `create_routine` tool (LLM creates YAML routines from conversation)
-- [ ] Add proactive cron: morning briefing, scheduled reminders
 - [ ] Tune CLAUDE.md personality through real usage
-- [ ] Implement web dashboard (FastAPI + HTMX): conversation log, system status, config
+- [ ] Implement web dashboard (FastAPI + HTMX): conversation log, mode indicator, system status, cost/token meter
 
-**Milestone:** "Jarvis, remember I prefer 23 degrees" → next day, thermostat defaults to 23.
+Local fallback (Mode B):
+- [ ] Build claw-code release binary on Jetson (`cd claw-code/rust && cargo build --release --workspace`)
+- [ ] Build llama.cpp with CUDA on Jetson; download `gemma-4-E2B-it-Q4_K_M.gguf` (and optionally `mmproj-gemma4-e2b-f16.gguf` for vision); start `llama-server --jinja`; benchmark TTFT and tools/sec
+- [ ] **Verify claw-code can route to `llama-server`'s `/v1` with `.claw.json`** and round-trip MCP tool calls (requires `--jinja` so Gemma 4's tool template is active). If not, fork claw-code or write a thin custom harness around `/v1/chat/completions` with tool support.
+- [ ] Implement `LocalAdapter` and `ModeSupervisor` in `jarvis_brain.py`
+- [ ] Add network health check + failure cooldown
+- [ ] Test forced offline: pull network, verify Mode B kicks in within one turn
+- [ ] Test recovery: restore network, verify Mode A resumes
+- [ ] Tune Gemma's system prompt (slim CLAUDE.md variant — `llama-server` is launched with `-c 2048` per NVIDIA's reference config, so the local prompt budget is tight; trim CLAUDE.md aggressively for Mode B)
+- [ ] (Optional) Wire a `look_and_answer` MCP tool that captures a webcam frame and posts it to `llama-server`'s multimodal endpoint — exercises Gemma 4's VLA capability and gives Mode B a vision tool the cloud path doesn't currently have
+
+> **Skip cron/proactive prompts.** The original plan had scheduled `claude -p` jobs (morning briefing, etc.). Drop them — they add cost on Mode A and unattended hallucinations on Mode B with little user value. Use deterministic routines instead.
+
+**Milestone:** "Jarvis, remember I prefer 23 degrees" → next day, thermostat defaults to 23. Pull the network cable mid-conversation → next response is Gemma, dashboard flips to OFFLINE, no user-facing error.
 
 ### Phase 5 — Polish and expansion (Week 9+)
 **Goal:** Production quality.
 
-- [ ] Add CosyVoice2 voice cloning (Jarvis voice for both EN and RU)
+- [ ] Add Fun-CosyVoice3-0.5B-2512 for cloned Jarvis voice (English); deploy via Triton + TensorRT-LLM on Jetson; implement on-demand load/unload around Kokoro
 - [ ] Add Telegram as remote control channel (future, not priority)
 - [ ] Add `web_search` tool to MCP server
 - [ ] Implement prompt injection defense on tool results
@@ -569,14 +763,16 @@ Note: LLM runs in the cloud (Claude Max subscription), so no local LLM memory ne
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| Claude Max subscription rate limited | Slow or refused LLM responses | YAML routines still work. `speak` tool falls back to "I'm having trouble connecting." Monitor usage against Max limits. |
-| Claude Code CLI subprocess latency | Slow first response | Keep session warm with `--session-id`. Pre-spawn if possible. Accept 500ms startup. |
-| Node.js on Jetson ARM64 issues | CLI won't run | Node 22 LTS has official ARM64 builds. Test early in Phase 1. |
-| CLAUDE.md grows too large | Context window overflow | Claude Code has built-in compaction. Daily session rotation trims history. |
-| Prompt injection via HA sensor data | Unintended actions | Safety gate hook blocks dangerous actions. Sanitize all tool results. |
-| TTS latency with CosyVoice | Slow voice output | Start with Kokoro (fast). CosyVoice is Phase 5. Pre-cache common phrases. |
-| Max subscription plan changes | Pricing or feature changes | Monitor Anthropic announcements. API key fallback is easy to add later. |
-| MCP server crashes | Tools unavailable | supervisord restarts MCP server. Claude Code handles tool errors gracefully. |
+| Anthropic API outage / rate limit | Mode A unavailable | Mode supervisor flips to Mode B (local Gemma). YAML routines still work for the simple stuff. |
+| API cost overrun on Mode A | Bill spike | Prompt caching on CLAUDE.md + tools. Cap monthly spend in Anthropic console. Daily token budget alarm on dashboard. Default to Haiku, escalate to Sonnet sparingly. |
+| claw-code OpenAI-compat routing doesn't work as expected | Mode B unbuildable as designed | Fallback plan: write a thin Python harness around `ollama.chat()` with tool support. Validate this in Phase 4 spike before committing. |
+| Gemma 4 E2B tool-use brittleness | Mode B drops `speak` calls or hallucinates entities | Launch `llama-server --jinja` so the native tool template is active. Slimmer CLAUDE.md variant for local (2048-token context). Stricter `tool_choice`. Safety gate hook catches dangerous outputs. Prefer YAML routines when offline. |
+| Gemma 4 E2B + CV3 both hot → OOM | Jetson swap thrash or kill (combined ~8.3 GB > 8 GB) | Brain and TTS publish resident-model state to Redis; TTS refuses CV3 swap-in while Mode B is active. 8 GB swap configured as safety net during transitions. |
+| CLAUDE.md grows too large | Context window overflow (esp. on Gemma) | Daily summary + truncate old turns. Memory section capped (e.g., 2 KB) with LRU eviction. |
+| Prompt injection via HA sensor data | Unintended actions | Safety gate hook blocks dangerous actions on both modes. Sanitize all tool results before returning. |
+| TTS latency with CosyVoice | Slow voice output | Kokoro is the daily driver. CosyVoice is Phase 5 only. Pre-cache common phrases. |
+| MCP server crashes | Tools unavailable in both modes | supervisord restarts MCP server. Both adapters tolerate tool errors. |
+| Anthropic pricing changes | Cost shifts | Mode B is the structural hedge — Jarvis keeps working at $0/month if cloud becomes uneconomic. |
 
 ---
 
