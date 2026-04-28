@@ -22,6 +22,8 @@ CH_TTS_DONE = "tts_done"
 CH_STATE = "state_change"
 CH_BARGE_IN = "barge_in"
 CH_TIMER_SET = "timer_set"
+CH_TTS_LEVEL = "tts_level"
+CH_TTS_STATE = "tts_state"
 
 
 def redis_url() -> str:

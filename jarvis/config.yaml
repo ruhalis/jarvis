@@ -24,3 +24,14 @@ home_assistant:
 tts:
   # Default language when none specified.
   default_language: en
+  # Engine: "kokoro" (Jetson), "say" (macOS dev), "espeak" (Linux dev), "null" (silent — log only).
+  # If "auto", picks the best available at startup.
+  engine: auto
+  # Kokoro voice id (when engine=kokoro). See kokoro docs for full list.
+  kokoro_voice: af_heart
+  kokoro_speed: 1.0
+  # Cache pre-rendered phrases (WAV) here to avoid resynthesizing common acks.
+  cache_dir: cache/tts
+  # Publish ~30 Hz RMS while speaking (for the RGB matrix EQ animation).
+  publish_levels: true
+  level_hz: 30
