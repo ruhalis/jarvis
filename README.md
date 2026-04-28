@@ -17,34 +17,14 @@ source .venv/bin/activate
 # PyTorch for JetPack 6.2
 pip install torch==2.8.0 torchvision==0.23.0 --index-url=https://pypi.jetson-ai-lab.io/jp6/cu126
 
-# torch2trt (TensorRT conversion) — tensorrt comes pre-installed with JetPack
-cd vendor/torch2trt && python setup.py install && cd ../..
-
-# whisper_trt
-cd vendor/whisper_trt && python setup.py install && cd ../..
-
 # Python dependencies
 pip install -r requirements.txt
 ```
 
-### Install on desktop (RTX GPU)
+STT uses Parakeet-TDT-0.6b-v3 via NeMo (TensorRT export through NeMo's
+own tooling). See `TECHNICAL.md` for the full pipeline.
 
-```bash
-# PyTorch + TensorRT
-pip install torch torchvision
-pip install tensorrt
-
-# torch2trt
-cd vendor/torch2trt && python setup.py install && cd ../..
-
-# whisper_trt
-cd vendor/whisper_trt && python setup.py install && cd ../..
-
-# Python dependencies
-pip install -r requirements.txt
-```
-
-### CosyVoice TTS (optional — voice cloning)
+### CosyVoice TTS (optional — voice cloning, Phase 5)
 
 ```bash
 # Install CosyVoice dependencies (from vendored submodule)
@@ -64,9 +44,6 @@ snapshot_download('FunAudioLLM/CosyVoice2-0.5B',
 
 # NOTE: Do NOT install the ttsfrd .whl on Jetson — it's x86_64 only.
 # CosyVoice falls back to wetext automatically.
-
-# Test it
-python cosy_voice.py test
 ```
 
 > **Note:** macOS is not supported — CUDA/TensorRT require an NVIDIA GPU.
